@@ -153,5 +153,298 @@ The primary target is Q-value regression.
 
 For each state, the target contains four values:
 
-```text
-Q(stop), Q(continue), Q(branch), Q(verify_check)
+    Q(stop), Q(continue), Q(branch), Q(verify_check)
+
+Also compute the oracle-best action:
+
+    oracle_action = argmax_a Q(s, a)
+
+Do not train only a four-way classifier. If two actions are close, the argmax label can be noisy. Preserve value margins.
+
+Recommended training objective for the main MLP:
+
+    Loss =
+        Huber(Q_pred, Q_observed)
+        + beta * CE(argmax(Q_observed), softmax(Q_pred))
+
+`beta` should be selected using validation data only.
+
+## Controllers to Implement
+
+Implement at least the following.
+
+### 1. Linear / Logistic Baseline
+
+Purpose:
+
+- interpretable baseline
+- checks whether signal is simple
+- sanity check against overpowered controller
+
+It may be implemented as:
+
+- linear regression over Q-values
+- multinomial logistic regression over oracle actions
+- or both
+
+### 2. Small MLP Main Controller
+
+Purpose:
+
+- main CVRO operation-selection controller
+
+Requirements:
+
+- lightweight
+- fixed small architecture from config
+- outputs predicted Q-values for the four operations
+- supports 3 pilot controller seeds
+- saves model checkpoints and prediction artifacts
+
+Do not make this a large opaque model.
+
+### 3. Scalar Adaptive Compute Baseline
+
+This is one of the most important baselines.
+
+It should receive comparable state features but must not choose among operation types.
+
+It should predict only a scalar compute decision such as:
+
+- stop/continue length
+- token budget
+- short/medium/long reasoning budget
+- or another scalar budget schedule
+
+It cannot choose branch or verify/check as separate operation types.
+
+Purpose:
+
+> Test whether CVRO is more than adaptive token-budget allocation.
+
+The scalar baseline should be as strong as reasonably possible within its restricted action space.
+
+### 4. Prompt-Only / Input-Only Controller
+
+Purpose:
+
+> Test whether intermediate reasoning state matters.
+
+Prompt-only should use only the original prompt, with no intermediate trace.
+
+Input-only may include prompt plus metadata such as domain/source/difficulty, but no intermediate reasoning state. If prompt-only and input-only become identical in implementation, document the equivalence.
+
+### 5. Shuffled-State Controller
+
+Purpose:
+
+> Test whether state features are aligned with the correct task/state rather than acting as generic priors.
+
+Implementation requirement:
+
+- preserve feature distributions
+- break state-example alignment
+- keep split integrity
+- do not accidentally leak target labels
+
+The shuffled controller should be trained/evaluated under the same controller class and seed setup where feasible.
+
+### 6. Remove-Action Controllers
+
+Support ablations where the controller cannot choose one operation.
+
+Required remove-action settings:
+
+| Ablation | Allowed actions |
+|---|---|
+| `no_stop` | continue, branch, verify/check |
+| `no_continue` | stop, branch, verify/check |
+| `no_branch` | stop, continue, verify/check |
+| `no_verify_check` | stop, continue, branch |
+
+At inference/prediction time, unavailable actions should be masked out before selecting the predicted-best action.
+
+These ablations test whether each operation matters.
+
+## Action Selection
+
+Given predicted Q-values, choose the action with the highest predicted value among allowed actions.
+
+The prediction artifact should include:
+
+- predicted Q-values for all operations
+- selected action
+- action ranking
+- top-2 margin
+- masked actions if any
+- controller name
+- controller seed
+- feature configuration
+- lambda/cost setting
+
+## Training Seeds
+
+For the pilot, use **3 controller seeds**.
+
+Every trained controller should record:
+
+- seed
+- feature config
+- model config
+- lambda/cost setting
+- train/val artifact hashes
+- run ID
+- training metrics
+- validation metrics
+
+The full run may later use 5 seeds, but the pilot target is 3.
+
+## Data Splits and Leakage Rules
+
+Use:
+
+- train action values for fitting
+- validation action values for hyperparameter selection
+- test-audit action values only for final audit/regret analysis
+
+Do not use test-audit labels for:
+
+- model training
+- early stopping
+- hyperparameter tuning
+- feature selection
+- lambda selection
+- threshold selection
+
+This should be enforced structurally if possible.
+
+## Metrics to Compute
+
+For validation and test-audit predictions, compute:
+
+| Metric | Description |
+|---|---|
+| Operation-selection accuracy | Selected action equals oracle action. |
+| Top-2 accuracy | Selected action is among top two observed Q-values. |
+| Regret | Oracle Q-value minus selected-action Q-value. |
+| Mean predicted-selected Q | Average observed Q of selected actions. |
+| Action distribution | Frequency of selected stop/continue/branch/verify_check. |
+| Per-domain metrics | Metrics by math/code/symbolic. |
+| Per-state-position metrics | Metrics by early/middle/late/post-operation source. |
+| Margin calibration | Relationship between predicted margin and regret if feasible. |
+| Invalid-action rate | Should be zero after masking. |
+
+The final pilot runner will evaluate end-to-end accuracy/cost; this stage should focus on action prediction and regret over existing action values.
+
+## Cost Settings and Lambda Handling
+
+The action-value artifacts may include multiple lambda/cost settings.
+
+The controller should support:
+
+- training for a default lambda
+- evaluating across a lambda sweep if available
+- selecting main lambda using validation only
+
+Do not tune lambda on test-audit data.
+
+Store the lambda/cost setting used in every model and prediction artifact.
+
+## Integration With Runtime Policy
+
+The controller should expose an interface that the later pilot runner can call at inference time.
+
+It should be able to take a current `ReasoningState` and return:
+
+- predicted Q-values
+- selected operation
+- action ranking
+- confidence/margin
+- feature vector metadata
+
+This runtime interface should use the same feature extraction path as training.
+
+Avoid duplicating feature logic between training and inference.
+
+## Local Dry Run
+
+Support a local dry run using tiny mock or sample action-value artifacts.
+
+The dry run should:
+
+- load small state/action-value files
+- extract features
+- train a tiny controller
+- save predictions
+- compute basic metrics
+- run at least one remove-action ablation
+- run prompt-only or shuffled-state control if possible
+
+## Validation Checks
+
+Add checks for:
+
+- every feature row maps to a valid state
+- every target row maps to a valid state
+- no duplicate state IDs within a split
+- train/val/test separation
+- test-audit labels not used for fitting
+- feature ablation configs actually remove intended feature groups
+- shuffled-state baseline actually shuffles alignment
+- remove-action masks actually prevent selecting removed actions
+- prediction artifacts include all four Q-values
+- selected action is always in allowed action set
+- metrics are computed over task/state units correctly
+
+## Artifact Integrity
+
+Saved model and prediction artifacts should include:
+
+- config hash
+- feature schema version
+- controller type
+- controller seed
+- lambda setting
+- train/val artifact hashes
+- timestamp/run ID
+
+If feature schemas change, stale models should not silently load as valid.
+
+## Do Not Do
+
+Do not fine-tune the base language model.
+
+Do not train a large transformer controller.
+
+Do not use test-audit action values for tuning.
+
+Do not include gold correctness or oracle labels as input features.
+
+Do not leak future operation outcomes into runtime features.
+
+Do not let scalar adaptive compute choose branch or verify/check as distinct operations.
+
+Do not let prompt-only/input-only see intermediate trace features.
+
+Do not silently ignore missing features without recording missingness.
+
+Do not collapse all training to oracle-action classification only.
+
+## Definition of Done
+
+This prompt is complete when the repository can:
+
+1. load state and action-value artifacts,
+2. extract runtime-valid controller features,
+3. train a linear/simple baseline,
+4. train the main small MLP controller,
+5. train or run scalar adaptive compute baseline,
+6. run prompt-only/input-only controls,
+7. run shuffled-state control,
+8. run remove-action ablations,
+9. produce validation and test-audit predictions,
+10. compute action-selection and regret metrics,
+11. save model/prediction artifacts with config metadata,
+12. support local dry runs.
+
+The controller layer must be ready for the pilot orchestration stage, where controllers will be evaluated end-to-end against dangerous baselines.
